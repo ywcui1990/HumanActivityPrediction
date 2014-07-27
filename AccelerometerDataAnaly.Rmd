@@ -1,0 +1,246 @@
+---
+title: "Human Activity Recognition"
+author: "Yuwei Cui"
+date: "July 25, 2014"
+output: html_document
+---
+
+# Synopsis
+
+In this study, we applied a variety of machine learning algorithms to the problem of human activity recognition. Specifically, we used the data from accelerometers on the belt, forearm, arm, and dumbel of 6 participants to predict which way the subject is doing barbel lift. Five different algorithms were compared, including linear discriminant analysis (LDA), Decision Tree (DT), Support Vector Machine (SVM), Gradient Boosting (GB) and Random Foreset (RF). The performance was reported as accuracy rate on the testing dataset, and out of sample error was estimate with cross-validation. 
+
+# Data processing
+
+Download and load data into workspace
+```{r, cache=TRUE}
+setwd('/Users/ywcui/Study/R/projects/HumanActivityPrediction_Proj')
+download.file(url = 'http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv',destfile='pml-training.csv')
+data <- read.csv('pml-training.csv')
+```
+
+We will be using the R package "reshape2" and "plyr" to pre-process data, the "caret" package for machine learning and the "ggplot2" package for plotting.
+
+```{r, echo=F}
+require(reshape2)
+require(plyr)
+require(ggplot2)
+require(caret)
+require(Hmisc)
+```
+
+
+First, check whether we have missing values in the dataset, and only considers columns without missing data for further analysis.
+```{r}
+numMissingData <- colwise(function(x) sum(is.na(x)))(data)
+data = data[,numMissingData==0]
+```
+
+Also, the first few columns contains information that is not relevant to the exercise, and we removed from the data before further analysis
+
+```{r}
+data = data[,-(1:7)]
+```
+
+Convert the "classe" column into factor class.
+```{r}
+data$classe =factor(data$classe) 
+```
+
+We also down-sampled the data for efficiency purpose. This is generally not desirable if we have access to enough computation resources.
+```{r}
+set.seed(1234)
+data = data[sample(dim(data)[1],4000),]
+```
+Partition the data into a training dataset and a testing dataset, we only adjust parameters of the algorithm using the training set.
+
+```{r}
+set.seed(1234)
+inTrain = createDataPartition(y = data$classe, p = .5, list = FALSE)
+training = data[inTrain,]
+testing = data[-inTrain,]
+```
+
+We excluded factor predictors from the dataset since several algorithms have trouble to deal with factor predictors.
+
+```{r}
+trainDataNoFactor <- cbind(training[,sapply(training, class) != "factor"],
+                        classe = training[,"classe"])
+testDataNoFactor <- cbind(testing[,sapply(testing, class) != "factor"],
+                            classe = testing[,"classe"])
+
+
+```
+
+Pre-process numeric data with principle component analysis to reduce dimensionality
+
+```{r}
+dataNumeric <- training[,sapply(training, class) == "numeric"]
+testDataNumeric <- testing[,sapply(testing, class) == "numeric"]
+
+preProc <- preProcess(dataNumeric, method="pca", pcaComp = dim(dataNumeric)[2])
+trainPC <- predict(preProc, dataNumeric)
+testPC <- predict(preProc, testDataNumeric)
+```
+
+# Prediction of human activity
+
+We tested the performance of several machine learning algorithms in this section, including 
+- Linear discriminant analysis (LDA)
+- Support vector machine (SVM)
+- Decision tree (DT)
+- Gradient Boosting (GBM)
+- Random forest (RF)
+
+The out-of-sample error was measured with cross-validation. We used 10-fold cross validation for all the algorithms. 
+```{r}
+
+fitControl <- trainControl(# 10-fold CV
+                           method = "repeatedcv",
+                           number = 10,
+                           # repeated ten times
+                           repeats = 10)
+```
+
+## Linear Discriminant Analysis (LDA)
+
+First, we tested the performance of linear-discriminant analysis. We only considered numeric predictors for this analysis, since it is not appropriate to apply LDA to discrete data (int or factor). We used princinple component analysis (PCA) before applying LDA to avoid colinearity of predictors. The accuracy of LDA were plotted as a function of number of principle components.
+
+
+```{r, cache=TRUE}
+
+perfLDAtrainvsPC = numeric()
+perfLDAtestvsPC = numeric()
+perfLDAtrainSD = numeric()
+for(pcnum in 5:27){
+  set.seed(1)
+  trainData = cbind(trainPC[,1:pcnum], classe = training$classe)
+  testData = cbind(testPC[,1:pcnum], classe = testing$classe)
+  
+  modLDA <- train(classe ~ ., method = "lda", data = trainData, preProc = c("center", "scale"),
+                  trControl = fitControl)
+  
+  perfLDAtest <- sum(predict(modLDA, testData) == testData$classe)/ dim(testData)[1]
+  perfLDAtrainvsPC <- c(perfLDAtrainvsPC, modLDA$result$Accuracy)
+  perfLDAtrainSD <- c(perfLDAtrainSD, modLDA$result$AccuracySD)
+  perfLDAtestvsPC <- c(perfLDAtestvsPC, perfLDAtest)  
+}
+
+perf = data.frame(PCnum = 5:27, Training = perfLDAtrainvsPC, TrainingSD = perfLDAtrainSD,Testing = perfLDAtestvsPC)
+
+# plot accuracy as a function of PC number
+ggplot(data=perf,aes(x=PCnum, y=perfLDAtrainvsPC, colour='blue')) + geom_line() + 
+  geom_errorbar(aes(ymin=perfLDAtrainvsPC+perfLDAtrainSD, ymax=perfLDAtrainvsPC-perfLDAtrainSD), width=0.2)+
+  geom_line(aes(x=PCnum, y=perfLDAtestvsPC, colour='red'))+
+  scale_color_manual(values = c("blue" = 'blue','red' = 'red'), labels=c("Training", "Testing"))+
+  xlab(" Number of Principle Components") + 
+  ylab(" Accuracy of LDA")
+  
+sprintf(" Performance of LDA: %f (training), SD = %f ",
+        modLDA$results$Accuracy[1], modLDA$results$AccuracySD[1])
+
+sprintf(" Performance of LDA: %f (testing)", perfLDAtest)
+
+```
+
+The accuracy of LDA increases with the number of principle components, and achieves about 50% when all principle components were included, which suggest that dimensionality reduction may not be required on this dataset. The standard deviation of accuracy 0.03 estimated with cross-validation. Performance on the testing dataset is comparable with the training dataset (within 1 standard deviations).
+
+## Decision Tree Model (DT)
+
+Next we applied the decision tree model provided by the rpart package. We used both continuous numeric and discrete int type data for this analysis. We used 10-fold cross validation to prune the tree.
+
+```{r, cache=TRUE}
+set.seed(1)
+
+modDT <- train(classe ~ ., method = "rpart", data = trainDataNoFactor, trControl = fitControl)
+
+perfDTtest <- sum(predict(modDT, testDataNoFactor) == testDataNoFactor$classe)/ dim(testDataNoFactor)[1]
+
+sprintf(" Performance of DT: %f (testing)", perfDTtest, modDT$results$AccuracySD[1])
+
+plot(modDT)
+```
+
+The accuracy of DT is about 52%, slightly better than that of the LDA algorithm (48%). The accuracy decrease as a function of complexity. Caret package used cross-validation to prune the tree to get maximal performance.
+
+
+## Support Vector Machine (SVM)
+
+In this section we applied support vector machine algorithm with radial basis funciton. to the algorithm. We used only numeric data for training SVM.
+
+```{r, cache=TRUE}                   
+set.seed(1)
+
+trainData = cbind(dataNumeric, classe = training$classe)
+testData = cbind(testDataNumeric, classe = testing$classe)
+
+modSVM <- train(classe ~ ., data = trainData,
+                 method = "svmRadial",
+                 preProc = c("center", "scale"),
+                 tuneLength = 8, trControl = fitControl)
+
+perfSVMtrain <- sum(predict(modSVM, trainData) == trainData$classe)/ dim(trainData)[1]
+perfSVMtest <- sum(predict(modSVM, testData) == testData$classe)/ dim(testData)[1]
+
+sprintf(" Performance of SVM: %f (testing), SD = %f", perfSVMtest, modSVM$results$AccuracySD[8])
+
+plot(modSVM)
+
+```
+
+The performance of SVM is much better than LDA and Decision Tree, achieving 88% on the testing set. The model performance increase as a function standard cost parameter in SVM. The caret package automatically select the optimal cost parameter based on cross validation.
+
+## Gradient Boosting Model (GBM)
+
+We next evaluated the performance of the gradient boosting algorithm. 
+
+```{r, cache=TRUE}
+set.seed(1)
+
+trainData <- trainDataNoFactor
+testData <- testDataNoFactor
+
+modGBM <- train(classe ~ ., method = "gbm", data = trainData, verbose=FALSE, trControl = fitControl)
+perfGBMtrain <- sum(predict(modGBM, trainData) == trainData$classe)/ dim(trainData)[1]
+perfGBMtest <- sum(predict(modGBM, testData) == testData$classe)/ dim(testData)[1]
+
+sprintf(" Performance of GBM: %f (testing), SD = %f", perfGBMtest,modGBM$results$AccuracySD[9])
+
+```
+
+The gradient boosting algorithm has a performance of 93% on the testing set, even better than the SVM algorithm.
+
+## Random Forest Model
+
+Finally, we applied the random foreset algorithm.
+
+```{r, cache=TRUE}
+
+modRF = train(classe ~ ., method = "rf", data = trainDataNoFactor, trControl= fitControl)
+
+perfRFtrain <- sum(predict(modRF, trainDataNoFactor) == trainDataNoFactor$classe)/ dim(trainDataNoFactor)[1]
+perfRFtest <- sum(predict(modRF, testDataNoFactor) == testDataNoFactor$classe)/ dim(testDataNoFactor)[1]
+
+sprintf(" Performance of Random Forest: %f (testing), SD = %f ", perfRFtest, modRF$results$AccuracySD[1])
+
+```
+
+The random forest algorithm gives best performance among all algorithms, achieves a remarkable 96% correct on the testing data set.
+
+We further calculate the confusion matrix for the random forest algorithm (shown below). The algorithm gets most of the data classified correctly.
+
+```{r, cache=TRUE}
+confusionMatrix(predict(modRF, testData),testDataNoFactor$classe)
+```
+
+## Summary of model performance
+
+The performances of different algorithms were displayed below as a summary. 
+```{r, cache=TRUE, echo=FALSE}
+algorithm=c('LDA','Decision Tree','SVM','Gradient Boosting','Random Forest')
+algorithm=factor(algorithm, level=algorithm, ordered=T)
+perfSummary = data.frame(Algorithm=algorithm,
+            Accuracy=c(perfLDAtest, perfDTtest, perfSVMtest, perfGBMtest, perfRFtest))
+
+qplot(x=algorithm, y=Accuracy, data=perfSummary,fill=algorithm, geom="bar", stat='identity')
+```
+
